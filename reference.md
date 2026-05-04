@@ -139,51 +139,121 @@ task = PythonOperator(
 from airflow import DAG
 from airflow.utils.dates import days_ago
 from airflow.models import Variable
+from airflow.models.baseoperator import chain
+from airflow.operators.python import PythonOperator
 from airflow.providers.amazon.aws.operators.s3 import S3ListOperator
 from airflow.providers.databricks.operators.databricks import DatabricksSubmitRunOperator
 from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
+from datetime import timedelta
+
+# ----------------------------
+# Default Config (CRITICAL)
+# ----------------------------
+default_args = {
+    "owner": "data-engineering",
+    "depends_on_past": False,
+    "start_date": days_ago(1),
+    "email": ["alerts@company.com"],
+    "email_on_failure": True,
+    "email_on_retry": False,
+    "retries": 3,
+    "retry_delay": timedelta(minutes=5),
+    "execution_timeout": timedelta(hours=2),
+}
+
+# ----------------------------
+# DAG Definition
+# ----------------------------
 with DAG(
-    dag_id="prod_pipeline",
-    start_date=days_ago(1),
-    schedule_interval="0 2 * * *",
+    dag_id="s3_to_snowflake_pipeline",
+    default_args=default_args,
+    schedule_interval="0 2 * * *",  # Daily 2 AM
     catchup=False,
-    max_active_runs=1
+    max_active_runs=1,
+    tags=["production", "databricks", "snowflake"],
 ) as dag:
 
-    list_files = S3ListOperator(
-        task_id="list_files",
-        bucket="raw_bucket",
-        prefix="incoming/"
+    # ----------------------------
+    # Task 1: List files in S3
+    # ----------------------------
+    list_s3_files = S3ListOperator(
+        task_id="list_s3_files",
+        bucket=Variable.get("raw_bucket"),
+        prefix="incoming/data/",
+        aws_conn_id="aws_default"
     )
 
-    databricks_job = DatabricksSubmitRunOperator(
-        task_id="dbx_job",
+    # ----------------------------
+    # Task 2: Submit Databricks Job
+    # ----------------------------
+    databricks_task = DatabricksSubmitRunOperator(
+        task_id="run_databricks_job",
         databricks_conn_id="databricks_default",
         json={
             "new_cluster": {
-                "spark_version": "13.x",
+                "spark_version": "13.3.x-scala2.12",
                 "node_type_id": "i3.xlarge",
                 "num_workers": 2
             },
             "notebook_task": {
-                "notebook_path": "/Repos/etl"
+                "notebook_path": "/Repos/project/etl_notebook",
+                "base_parameters": {
+                    "input_path": "s3://bucket/incoming/data/",
+                    "output_path": "s3://bucket/processed/"
+                }
             }
         }
     )
 
+    # ----------------------------
+    # Task 3: Load into Snowflake
+    # ----------------------------
     snowflake_load = SnowflakeOperator(
-        task_id="sf_load",
-        sql="COPY INTO table FROM @stage"
+        task_id="load_to_snowflake",
+        snowflake_conn_id="snowflake_default",
+        sql="""
+        COPY INTO analytics.table_name
+        FROM @s3_stage/processed/
+        FILE_FORMAT = (TYPE = 'CSV' FIELD_OPTIONALLY_ENCLOSED_BY='"')
+        ON_ERROR = 'CONTINUE';
+        """
     )
 
-    trigger = TriggerDagRunOperator(
-        task_id="trigger_next",
-        trigger_dag_id="downstream_dag"
+    # ----------------------------
+    # Task 4: Data Validation
+    # ----------------------------
+    def validate_data(**context):
+        # Example: pull row count from Snowflake
+        # (in real setup use SnowflakeHook)
+        print("Validating data...")
+
+    validate_task = PythonOperator(
+        task_id="validate_data",
+        python_callable=validate_data,
+        provide_context=True
     )
 
-    list_files >> databricks_job >> snowflake_load >> trigger
+    # ----------------------------
+    # Task 5: Trigger downstream DAG
+    # ----------------------------
+    trigger_next = TriggerDagRunOperator(
+        task_id="trigger_reporting_dag",
+        trigger_dag_id="reporting_pipeline",
+        wait_for_completion=False
+    )
+
+    # ----------------------------
+    # Dependencies
+    # ----------------------------
+    chain(
+        list_s3_files,
+        databricks_task,
+        snowflake_load,
+        validate_task,
+        trigger_next
+    )
 ```
 
 ---
