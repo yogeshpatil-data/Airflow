@@ -414,7 +414,9 @@ They can block resources if not used properly.
 S3KeySensor(
     task_id="wait",
     bucket_key="file.csv",
-    bucket_name="bucket"
+    bucket_name="bucket",
+    mode = "schedule/poke",
+    deferable = "True" #for deferable operator
 )
 ```
 
